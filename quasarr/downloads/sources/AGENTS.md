@@ -50,6 +50,7 @@ Search-side notes live in `quasarr/search/sources/AGENTS.md`.
 - **SL** - every fetch requires Cloudflare clearance via the shared bypass helper (like its search side); direct links restricted to a two-hoster whitelist.
 - **WD** - resolves on-site redirects into filecrypt protected links via `detect_crypter_type`, with a FlareSolverr fallback on Cloudflare challenges.
 - **WX** - 4-tier mirror selection on source-provided status badges: green hide container > green filecrypt container > green direct links > first offline-flagged mirror as last resort. The badge certifies the crypted container, not the separately-uploaded direct links; link sets are never merged across mirrors; the tier-4 fallback keeps all multipart URLs. Uploads from the user ids in `HIDE_CX_MIRROR_USER_IDS` get their filecrypt container rewritten to the hide-crypter `/fc/` twin so `hide.py` auto-resolves it without a CAPTCHA - this mirrors the site's own frontend logic; when the hide twin is missing, `hide.py` returns nothing and the normal protected fallback applies.
+- **TC** - appends `/download/` to the search payload URL (episode, movie, or `/series/` season pack) and scrapes `a.downloadsLink`; resolution is read from the anchor text (multi-quality labels like `1080p - 720p` are treated as resolution-agnostic fallbacks); CAPTCHA-gated streaming hosts (incl. vidtube) are dropped so JDownloader packages can still reach 100%.
 
 ## Verification
 

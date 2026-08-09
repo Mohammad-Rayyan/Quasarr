@@ -266,6 +266,12 @@ class Linkgrabber:
         resp = self.device.action(self.url + "/moveToDownloadlist", params)
         return resp
 
+    def rename_link(self, link_id, new_name):
+        """Rename a crawled link in the linkgrabber (updates the download filename)."""
+        params = [link_id, new_name]
+        resp = self.device.action(self.url + "/renameLink", params)
+        return resp
+
     def query_links(
         self,
         params=None,
@@ -372,6 +378,12 @@ class Downloads:
     def remove_links(self, links_ids, packages_ids):
         params = [links_ids, packages_ids]
         resp = self.device.action(self.url + "/removeLinks", params)
+        return resp
+
+    def rename_link(self, link_id, new_name):
+        """Rename a download link (and its on-disk file when finished)."""
+        params = [link_id, new_name]
+        resp = self.device.action(self.url + "/renameLink", params)
         return resp
 
     def query_links(

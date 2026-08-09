@@ -1,0 +1,40 @@
+# Thin overlay on the official Quasarr image.
+#
+# Quasarr registers search sources by file existence alone, so dropping the
+# adapter modules into the installed package is enough - no fork of the upstream
+# build is needed. Rebuild after `docker pull` to pick up a new upstream release
+# with the adapters still applied.
+#
+# Also overlays the Sonarr-safe release-filename rename path so hoster names
+# like "[Anime4up.rest] OP EP 1172 FHD.mp4" become the Quasarr release title
+# before *arr imports.
+
+FROM ghcr.io/rix1337/quasarr:latest
+
+ARG PKG=/opt/uv-tools/quasarr/lib/python3.12/site-packages/quasarr
+
+COPY quasarr/search/sources/a4.py    ${PKG}/search/sources/a4.py
+COPY quasarr/downloads/sources/a4.py ${PKG}/downloads/sources/a4.py
+COPY quasarr/search/sources/sh.py    ${PKG}/search/sources/sh.py
+COPY quasarr/downloads/sources/sh.py ${PKG}/downloads/sources/sh.py
+COPY quasarr/search/sources/tc.py    ${PKG}/search/sources/tc.py
+COPY quasarr/downloads/sources/tc.py ${PKG}/downloads/sources/tc.py
+
+# Sonarr absolute-episode import fix (hoster filename -> release title)
+COPY quasarr/downloads/sources/helpers/sonarr_filenames.py \
+     ${PKG}/downloads/sources/helpers/sonarr_filenames.py
+COPY quasarr/providers/myjd_api.py ${PKG}/providers/myjd_api.py
+COPY quasarr/providers/utils.py ${PKG}/providers/utils.py
+COPY quasarr/downloads/packages/__init__.py ${PKG}/downloads/packages/__init__.py
+
+# Fail the build loudly if the upstream layout moved rather than shipping an
+# image where the adapter silently is not registered. Quasarr is installed as a
+# uv tool, so it is only importable from that environment's interpreter.
+RUN /opt/uv-tools/quasarr/bin/python -c "\
+from quasarr.search.sources.helpers import get_hostnames; \
+from quasarr.downloads.sources.helpers.sonarr_filenames import release_filename_for; \
+names = get_hostnames(); \
+missing = [k for k in ('a4', 'sh', 'tc') if k not in names]; \
+assert not missing, 'not registered: %s (have %s)' % (missing, names); \
+assert release_filename_for('[A4U] X - 1', 'a.mp4').endswith('.mp4'); \
+print('a4 + sh + tc + sonarr_filenames registered alongside', len(names) - 3, 'upstream sources')"

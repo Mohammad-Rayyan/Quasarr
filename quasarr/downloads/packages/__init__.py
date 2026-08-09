@@ -14,9 +14,13 @@ from quasarr.constants import (
     NOT_DOWNLOADABLE_MARKERS,
     PACKAGE_ID_PATTERN,
 )
+from quasarr.downloads.sources.helpers.sonarr_filenames import (
+    align_package_filenames_to_release_title,
+)
 from quasarr.providers.jd_cache import JDPackageCache
 from quasarr.providers.log import debug, info, trace
 from quasarr.storage.categories import get_download_category_from_package_id
+
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -127,11 +131,30 @@ def get_links_status(package, all_links, is_archive=False):
     #   - offline       : availability == "offline" (linkgrabber only)
     #   - not-downloadable: status contains "Not downloadable!" (availability stays "online")
     #   - file error    : statusIconKey == "false" (how the download list reports dead links)
+    #
+    # Special case: JD also paints statusIconKey "false" for "File already
+    # exists" even when bytes are complete. That is success, not a dead link —
+    # failing the package here made Sonarr/Radarr drop finished downloads.
     def _is_offline(link):
         return link.get("availability", "").lower() == "offline"
 
+    def _bytes_complete(link):
+        loaded = link.get("bytesLoaded") or 0
+        total = link.get("bytesTotal") or 0
+        return total > 0 and loaded >= total
+
+    def _is_already_exists_complete(link):
+        status = (link.get("status") or "").lower()
+        if "file already exists" not in status:
+            return False
+        return bool(link.get("finished")) or _bytes_complete(link)
+
     def _is_file_error(link):
-        return str(link.get("statusIconKey", "")).lower() == "false"
+        if str(link.get("statusIconKey", "")).lower() != "false":
+            return False
+        if _is_already_exists_complete(link) or link.get("finished"):
+            return False
+        return True
 
     def _is_not_downloadable(link):
         return is_not_downloadable(link.get("status"))
@@ -140,6 +163,8 @@ def get_links_status(package, all_links, is_archive=False):
     # JD only reports "availability" in the linkgrabber; download-list links
     # have it empty, so an empty value is treated as online.
     def _link_is_online(link):
+        if _is_already_exists_complete(link):
+            return True
         if _is_offline(link) or _is_not_downloadable(link) or _is_file_error(link):
             return False
         return link.get("availability", "").lower() in ("online", "")
@@ -219,6 +244,12 @@ def get_links_status(package, all_links, is_archive=False):
             f"extractionStatus='{link_extraction_status}', status='{link_status_preview}'"
         )
 
+        # JD: "File already exists" + full size == payload is on disk. Count as
+        # finished and skip the error/unfinished paths for this link.
+        if _is_already_exists_complete(link):
+            debug(f"Link already exists on disk (complete): {link_name}")
+            continue
+
         # Check for offline links
         if (
             link_availability in ["offline", "not downloadable"]
@@ -230,8 +261,9 @@ def get_links_status(package, all_links, is_archive=False):
             )
 
         # Check for file errors. With a healthy mirror present the bad link is
-        # removed below instead of failing the whole package.
-        if link_status_icon == "false" and not has_mirror_all_online:
+        # removed below instead of failing the whole package. Skip the
+        # already-exists / finished cases handled above (_is_file_error).
+        if _is_file_error(link) and not has_mirror_all_online:
             error = "File error in package"
             debug(f"ERROR - File error in link: {link_name}")
 
@@ -575,6 +607,19 @@ def get_packages(shared_state, _cache=None, auto_start=True):
 
             if not finished and link_details["eta"]:
                 package["eta"] = link_details["eta"]
+
+            # Hoster filenames (e.g. "[Anime4up.rest] OP EP 1172 FHD.mp4") break
+            # Sonarr's anime absolute-episode parser. Rename finished files to
+            # the Quasarr release title before reporting history to *arr.
+            if finished and not error and comment:
+                try:
+                    align_package_filenames_to_release_title(
+                        shared_state, package, downloader_links
+                    )
+                except Exception as e:
+                    debug(
+                        f"Release filename align failed for '{package_name}': {e}"
+                    )
 
             location = "history" if error or finished else "queue"
 

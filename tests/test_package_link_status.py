@@ -8,7 +8,14 @@ PACKAGE = {"uuid": 1, "name": "Synthetic.Release.Example"}
 
 
 def make_link(
-    uuid, url, availability="ONLINE", status="", finished=False, status_icon=""
+    uuid,
+    url,
+    availability="ONLINE",
+    status="",
+    finished=False,
+    status_icon="",
+    bytes_loaded=0,
+    bytes_total=0,
 ):
     return {
         "uuid": uuid,
@@ -19,6 +26,8 @@ def make_link(
         "status": status,
         "finished": finished,
         "statusIconKey": status_icon,
+        "bytesLoaded": bytes_loaded,
+        "bytesTotal": bytes_total,
     }
 
 
@@ -133,6 +142,71 @@ class GetLinksStatusNotDownloadableTests(unittest.TestCase):
 
         self.assertEqual(result["error"], "File error in package")
         self.assertEqual(result["file_error_linkids"], [])
+
+    def test_file_already_exists_complete_is_success(self):
+        # JD marks "File already exists" with statusIconKey "false" even when
+        # the file is fully on disk. That must finish the package, not fail it.
+        links = [
+            make_link(
+                11,
+                "http://mirror-a.invalid/f1",
+                availability="",
+                status="File already exists",
+                status_icon="false",
+                bytes_loaded=266668172,
+                bytes_total=266668172,
+            ),
+        ]
+
+        result = get_links_status(PACKAGE, links)
+
+        self.assertIsNone(result["error"])
+        self.assertTrue(result["all_finished"])
+        self.assertEqual(result["file_error_linkids"], [])
+
+    def test_file_already_exists_keeps_dead_mirror_for_cleanup(self):
+        # Complete "already exists" counts as a healthy mirror so the dead
+        # sibling is queued for removal instead of failing the package.
+        links = [
+            make_link(
+                11,
+                "http://mirror-a.invalid/f1",
+                availability="",
+                status="File already exists",
+                status_icon="false",
+                bytes_loaded=266668172,
+                bytes_total=266668172,
+            ),
+            make_link(
+                21,
+                "http://mirror-b.invalid/f1",
+                availability="",
+                status="Try restarting this link (plugin outdated?)",
+                status_icon="false",
+            ),
+        ]
+
+        result = get_links_status(PACKAGE, links)
+
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["file_error_linkids"], [21])
+
+    def test_file_already_exists_incomplete_still_fails_without_mirror(self):
+        links = [
+            make_link(
+                11,
+                "http://mirror-a.invalid/f1",
+                availability="",
+                status="File already exists",
+                status_icon="false",
+                bytes_loaded=100,
+                bytes_total=1000,
+            ),
+        ]
+
+        result = get_links_status(PACKAGE, links)
+
+        self.assertEqual(result["error"], "File error in package")
 
 
 if __name__ == "__main__":

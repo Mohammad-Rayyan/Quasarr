@@ -40,6 +40,9 @@ from quasarr.constants import (
     SESSION_REQUEST_TIMEOUT_SECONDS,
 )
 from quasarr.providers import radarr_api, sonarr_api
+from quasarr.downloads.sources.helpers.sonarr_filenames import (
+    align_linkgrabber_filenames_to_release_title,
+)
 from quasarr.providers.log import crit, debug, error, trace, warn
 from quasarr.search.sources.helpers import (
     get_login_required_hostnames,
@@ -1579,6 +1582,16 @@ def download_package(links, title, password, package_id, shared_state):
         submit,
         default=False,
     )
+    if downloaded:
+        # Best-effort: align linkgrabber names to the release title so the
+        # download starts with a Sonarr-parseable filename. Finished-state
+        # rename in packages/ is the reliable backstop if the hoster overrides.
+        try:
+            align_linkgrabber_filenames_to_release_title(
+                shared_state, package_id, title
+            )
+        except Exception as e:
+            debug(f"Linkgrabber release filename align failed: {e}")
     return downloaded
 
 
