@@ -324,7 +324,23 @@ class Source(AbstractSearchSource):
                 for resolution in sorted(resolutions, key=_resolution_sort_key, reverse=True)
                 if "|" not in _season_release_title(name, season, resolution, source_token)
             ]
-        return []
+
+        # TopCinema often lists a season hub with no hoster mirrors; downloads
+        # only exist on per-episode /download/ pages. Fall back so Sonarr
+        # interactive season search is not empty.
+        debug(
+            f"[{self.initials}] season pack has no download mirrors; "
+            f"falling back to {len(candidates)} episode release(s)"
+        )
+        releases = []
+        for card in candidates[:MAX_SEARCH_CANDIDATES]:
+            ep_card = card if card.get("season") is not None else {**card, "season": season}
+            release = self._release_from_card(
+                shared_state, ep_card, imdb_id=imdb_id, as_season_pack=False
+            )
+            if release:
+                releases.append(release)
+        return releases
 
     def _release_from_card(
         self, shared_state, card: dict, imdb_id, as_season_pack: bool
@@ -414,6 +430,9 @@ def _parse_cards(soup) -> list[dict]:
         kind, name, season, episode, year = _classify_title(raw_title, href)
         if not kind or not name:
             continue
+        # Single-season Asian titles often omit الموسم; Sonarr still asks for S01.
+        if kind == "episode" and episode and season is None:
+            season = 1
         cards.append(
             {
                 "title": raw_title,

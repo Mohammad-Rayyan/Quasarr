@@ -106,6 +106,20 @@ class FakeResponse:
 
 
 class TitleParsingTests(unittest.TestCase):
+    def test_missing_season_defaults_to_one_on_cards(self):
+        html = """
+        <html><body><div class="Small--Box">
+          <a href="https://source.invalid/ep1/">
+            <h3 class="title">مسلسل Ms. Incognito الحلقة 1 مترجمة</h3>
+            <ul class="liList"><li>1080p WEB-DL</li></ul>
+          </a>
+        </div></body></html>
+        """
+        cards = _parse_cards(BeautifulSoup(html, "html.parser"))
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["episode"], 1)
+        self.assertEqual(cards[0]["season"], 1)
+
     def test_episode_and_movie_classification(self):
         kind, name, season, episode, year = _classify_title(
             "مسلسل Example Show الموسم الثالث الحلقة 12 مترجمة",
@@ -198,6 +212,32 @@ class SearchSourceTests(unittest.TestCase):
         self.assertRegex(details["title"], r"\.S03\.\d{3,4}p\.")
         self.assertNotRegex(details["title"], r"\.S03E\d+")
         self.assertEqual(details["source"], "https://source.invalid/series/example-show-s3/")
+
+    def test_season_search_falls_back_to_episodes_when_pack_has_no_mirrors(self):
+        empty_pack = BeautifulSoup("<html><body></body></html>", "html.parser")
+
+        def fake_fetch(_shared, url, _timeout):
+            if "?s=" in url:
+                return BeautifulSoup(SEARCH_HTML, "html.parser")
+            if url.endswith("/series-ep-s3e12/") or url.endswith("/series-ep-s3e11/"):
+                return BeautifulSoup(EPISODE_PAGE_HTML, "html.parser")
+            if url.rstrip("/").endswith("/download"):
+                return empty_pack
+            return None
+
+        releases = self._run_search(
+            fake_fetch,
+            search_category=str(SEARCH_CAT_SHOWS),
+            search_string="Example Show",
+            season=3,
+            episode=None,
+        )
+
+        self.assertTrue(releases)
+        titles = [r["details"]["title"] for r in releases]
+        self.assertTrue(any(".S03E12." in t for t in titles))
+        self.assertTrue(any(".S03E11." in t for t in titles))
+        self.assertFalse(any(t.endswith("S03.1080p.WEB-DL.x264-TCinema") for t in titles))
 
     def test_movie_search(self):
         def fake_fetch(_shared, url, _timeout):
