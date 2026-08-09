@@ -125,6 +125,11 @@ def _resolution_of_label(text: str) -> str:
     return ""
 
 
+def _is_captcha_gated(row: dict) -> bool:
+    haystack = f"{row.get('mirror', '')} {row.get('url', '')}".lower()
+    return any(host in haystack for host in CAPTCHA_GATED_HOSTS)
+
+
 def _resolution_of_title(title: str) -> str:
     match = RESOLUTION_PATTERN.search(title or "")
     return f"{match.group(1)}p" if match else ""
