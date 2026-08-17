@@ -34,6 +34,17 @@ CAPTCHA_GATED_HOSTS = (
     "vkvideo",
     "mixdrop",
     "ok.ru",
+    "vidtube",
+    "freedl",
+    "frdl",
+    "freeldl",
+    "nitroflare",
+    "exe.io",
+    "ex-load",
+    "exload",
+    "up-4ever",
+    "up4ever",
+    "file-upload",
 )
 
 # FHD must be tested before HD, otherwise the substring matches first.

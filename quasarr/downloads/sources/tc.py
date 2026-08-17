@@ -11,6 +11,7 @@
 # them natively.
 
 import re
+import time
 from urllib.parse import urlparse
 
 import requests
@@ -23,9 +24,7 @@ from quasarr.providers.log import debug
 
 RESOLUTION_PATTERN = re.compile(r"(\d{3,4})p", re.I)
 
-# Streaming-first hosts that gate downloads behind a CAPTCHA. Leaving them in
-# the package parks JDownloader at "Skipped - Captcha is required" and Sonarr
-# never sees a finished download.
+# Streaming-first / captcha / account-gated / JD-broken hosts.
 CAPTCHA_GATED_HOSTS = (
     "streamruby",
     "rubyvidhub",
@@ -37,6 +36,39 @@ CAPTCHA_GATED_HOSTS = (
     "mixdrop",
     "ok.ru",
     "vidtube",
+    # premium-or-fail on free JD (no account configured)
+    "nitroflare",
+    # chronically dead / plugin-outdated on this stack
+    "exe.io",
+    "ex-load",
+    "exload",
+    "up-4ever",
+    "up4ever",
+    "file-upload",
+    # freel captcha plugin submits wrong answers with no MyJD prompt
+    "freedl",
+    "frdl",
+    "freeldl",
+    # JD has no plugin; we resolve these to DirectHTTP below when possible
+    "mdiaload",
+)
+
+# XFileSharing free-wait hosts JD cannot handle natively — resolve to CDN.
+XFS_RESOLVE_HOSTS = (
+    "updown",
+)
+
+# Prefer resolved directs / hosts JD can use unattended.
+PREFERRED_FREE_HOSTS = (
+    "directhttp",
+    "ddownload",
+    "1fichier",
+    "savefiles",
+    "cloudfile",
+    "gofile",
+    "mega",
+    "mp4upload",
+    "rapidgator",
 )
 
 
@@ -68,6 +100,15 @@ class Source(AbstractDownloadSource):
         if not usable:
             debug(f"[{self.initials}] only captcha-gated mirrors at {url}")
         rows = usable or rows
+
+        rows = [_resolve_row(shared_state, r) for r in rows]
+        rows = [r for r in rows if r.get("url")]
+
+        # Prefer free/reliable hosts first, but keep other non-captcha mirrors
+        # as fallback — exclusive filtering left packages with only dead links.
+        preferred = [r for r in rows if _is_preferred_free(r)]
+        other = [r for r in rows if not _is_preferred_free(r)]
+        rows = preferred + other
 
         rows = _apply_mirror_preference(rows, mirrors)
         return {
@@ -138,6 +179,78 @@ def _normalize_mirror(text: str, href: str) -> str:
 def _is_captcha_gated(row: dict) -> bool:
     haystack = f"{row.get('mirror', '')} {row.get('url', '')}".lower()
     return any(host in haystack for host in CAPTCHA_GATED_HOSTS)
+
+
+def _is_preferred_free(row: dict) -> bool:
+    haystack = f"{row.get('mirror', '')} {row.get('url', '')}".lower()
+    return any(host in haystack for host in PREFERRED_FREE_HOSTS)
+
+
+def _needs_xfs_resolve(row: dict) -> bool:
+    haystack = f"{row.get('mirror', '')} {row.get('url', '')}".lower()
+    return any(host in haystack for host in XFS_RESOLVE_HOSTS)
+
+
+def _resolve_row(shared_state, row: dict) -> dict:
+    """Resolve XFS free-wait pages (e.g. updown.cam) to DirectHTTP CDN URLs.
+
+    JDownloader has no updown.cam plugin, so raw links are silently dropped.
+    After the free countdown the host 302s to a gamescdn.online MP4 that JD
+    can fetch via DirectHTTP without captcha.
+    """
+    if not _needs_xfs_resolve(row):
+        return row
+    direct = _resolve_xfs_direct(shared_state, row["url"])
+    if not direct:
+        debug(f"[tc] XFS resolve failed for {row['url']}")
+        return {"url": "", "mirror": row.get("mirror", ""), "resolution": row.get("resolution")}
+    return {
+        "url": direct,
+        "mirror": "directhttp",
+        "resolution": row.get("resolution"),
+    }
+
+
+def _resolve_xfs_direct(shared_state, page_url: str) -> str:
+    session = requests.Session()
+    session.headers["User-Agent"] = shared_state.values["user_agent"]
+    try:
+        first = session.get(page_url, timeout=DOWNLOAD_REQUEST_TIMEOUT_SECONDS)
+        if first.status_code != 200:
+            return ""
+        soup = BeautifulSoup(first.content, "html.parser")
+        data = {
+            inp.get("name"): (inp.get("value") or "")
+            for inp in soup.find_all("input")
+            if inp.get("name")
+        }
+        if not data.get("op"):
+            return ""
+        second = session.post(
+            page_url, data=data, timeout=DOWNLOAD_REQUEST_TIMEOUT_SECONDS
+        )
+        soup2 = BeautifulSoup(second.content, "html.parser")
+        data2 = {
+            inp.get("name"): (inp.get("value") or "")
+            for inp in soup2.find_all("input")
+            if inp.get("name")
+        }
+        # Free countdown is usually ~10–20s; wait a bit over the common 15s.
+        time.sleep(16)
+        third = session.post(
+            page_url,
+            data=data2,
+            timeout=DOWNLOAD_REQUEST_TIMEOUT_SECONDS,
+            allow_redirects=False,
+            stream=True,
+        )
+        location = third.headers.get("Location") or ""
+        third.close()
+        if location.lower().startswith("http"):
+            return location
+    except Exception as exc:
+        debug(f"[tc] XFS resolve exception for {page_url}: {exc}")
+    return ""
 
 
 def _resolution_of(title: str) -> str:
