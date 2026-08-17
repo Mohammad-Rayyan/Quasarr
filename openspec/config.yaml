@@ -1,0 +1,19 @@
+schema: spec-driven
+
+context: |
+  Quasarr-a4u is an overlay on upstream Quasarr (ghcr.io/rix1337/quasarr) that adds
+  anime4up (`a4`), shahid (`sh`), and related Arabic DDL adapters via Dockerfile.a4u.
+  AGENTS.md is canonical. Prefer uv. Keep changes inside quasarr/search|downloads/sources.
+  Work on branch `dev` unless asked otherwise. Absolute-numbered anime for Sonarr;
+  a4 already skips season-relative searches. Tests: unittest under tests/.
+
+rules:
+  proposal:
+    - Keep proposals under ~500 words
+    - Always include Non-goals via Impact/scope clarity
+  design:
+    - Prefer bounded fetches (existing MAX_* caps)
+    - No hardcoding franchise tables unless fixtures prove a one-off
+  tasks:
+    - Checkbox format required for apply tracking
+    - Include fixture-backed unit tests before deploy verification

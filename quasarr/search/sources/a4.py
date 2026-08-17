@@ -35,7 +35,7 @@ from quasarr.constants import (
     SEARCH_CAT_SHOWS_ANIME,
     SEARCH_REQUEST_TIMEOUT_SECONDS,
 )
-from quasarr.providers import shared_state
+from quasarr.providers import sonarr_api
 from quasarr.providers.hostname_issues import clear_hostname_issue, mark_hostname_issue
 from quasarr.providers.imdb_metadata import get_localized_title
 from quasarr.providers.log import debug
@@ -50,10 +50,16 @@ from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 # Arabic markers used as structural anchors on the site.
 AR_EPISODE = "الحلقة"  # "episode", precedes the number in episode slugs
 AR_FILM = "فيلم"  # "film", marks a movie's single entry page
+AR_DUBBED = "مدبلج"  # "dubbed" - marks Arabic-dub duplicates of a subbed arc
 AR_TYPE_LABEL = "نوع الأنمي"  # "anime type" -> TV / Movie / OVA / ONA / Special
 AR_YEAR_LABEL = "بداية العرض"  # "airing start" -> year
 
-EPISODE_NUM_PATTERN = re.compile(re.escape(AR_EPISODE) + r"[-\s]+(\d+)")
+# The trailing boundary is not optional. Episode slugs on the site carry SEO
+# junk suffixes ("الحلقة-44pss" is really episode 330) and newer slugs drop the
+# number entirely ("الحلقة-smfpi"), so a number is trustworthy only when it is
+# immediately followed by a non-alphanumeric character. The real number always
+# lives in the listing card's .ep_num text instead - see _episode_entries.
+EPISODE_NUM_PATTERN = re.compile(re.escape(AR_EPISODE) + r"[-\s]+(\d+)(?![0-9A-Za-z])")
 YEAR_PATTERN = re.compile(r"(19|20)\d{2}")
 
 # Quality cell text looks like "FHD 1080p" / "HD 720p" / "SD 480p".
@@ -62,6 +68,9 @@ RESOLUTION_PATTERN = re.compile(r"(\d{3,4})p")
 # Bounded so a single search cannot walk a 25-page series to exhaustion.
 MAX_EPISODE_PAGES = 30
 MAX_SEARCH_CANDIDATES = 4
+# Arc resolution has to consider every franchise entry (a split series can have
+# a main run plus several arc pages), so it uses its own, wider cap.
+MAX_FRANCHISE_CANDIDATES = 12
 MAX_FEED_ITEMS = 12
 FEED_FETCH_WORKERS = 6
 
@@ -132,6 +141,10 @@ class Source(AbstractSearchSource):
             if not queries:
                 debug(f"[{self.initials}] could not resolve a title for {imdb_id}")
                 return []
+            if not want_movie and episode is not None:
+                episode = _canonical_absolute_episode(
+                    shared_state, imdb_id, episode
+                )
         else:
             queries = [search_string]
 
@@ -162,8 +175,20 @@ class Source(AbstractSearchSource):
         matches = [c for c in candidates if _title_matches(query, c["title"])]
         # Fall back to raw order when nothing survives strict matching; the
         # site's own relevance ranking is usually right for exact queries.
-        ordered = (matches or candidates)[:MAX_SEARCH_CANDIDATES]
+        franchise = matches or candidates
 
+        # A specific TV episode is answered by absolute-number resolution across
+        # the whole franchise (main run + split arcs), not by taking the first
+        # title match. See _resolve_tv_episode for the offset mapping.
+        if not want_movie and episode is not None:
+            return self._resolve_tv_episode(
+                shared_state,
+                franchise[:MAX_FRANCHISE_CANDIDATES],
+                episode,
+                SEARCH_REQUEST_TIMEOUT_SECONDS,
+            )
+
+        ordered = franchise[:MAX_SEARCH_CANDIDATES]
         releases: list[SearchRelease] = []
         for candidate in ordered:
             releases.extend(
@@ -293,7 +318,7 @@ class Source(AbstractSearchSource):
                 as_movie=True,
             )
 
-        target = _find_episode_url(
+        target, number = _locate_episode(
             shared_state, candidate["url"], page, episode, timeout
         )
         if not target:
@@ -307,10 +332,76 @@ class Source(AbstractSearchSource):
             entry_page,
             target,
             series_title=title,
-            episode_number=_episode_number(target),
+            episode_number=number,
             year=year,
             as_movie=False,
         )
+
+    # ------------------------------------------------------------------ #
+    # absolute-number arc resolution
+    # ------------------------------------------------------------------ #
+
+    def _resolve_tv_episode(
+        self,
+        shared_state,
+        candidates: list[dict],
+        episode: int,
+        timeout: int,
+    ) -> list[SearchRelease]:
+        """Map an absolute episode number onto the franchise's arc entries.
+
+        The site splits long franchises into separate ``/anime/<arc>/`` pages,
+        each numbered locally from 1 (Bleach: main run 1-366, then TYBW arcs
+        1-13, 1-13, 1-14, 1-4). Sonarr searches with the absolute number, so we
+        order the arcs oldest-first and walk cumulative local episode counts
+        until the requested absolute number falls inside one arc, then fetch
+        that arc's local episode. Labelling keeps the absolute number so Sonarr
+        still recognises the release for the episode it asked for.
+        """
+        chain = _franchise_chain(shared_state, candidates, timeout)
+        if not chain:
+            return []
+
+        base_title = chain[0]["title"]
+        offset = 0
+        for entry in chain:
+            count = entry["count"]
+            if count <= 0:
+                continue
+            if offset < episode <= offset + count:
+                local = episode - offset
+                target, _ = _locate_episode(
+                    shared_state, entry["url"], entry["page"], local, timeout
+                )
+                if not target:
+                    debug(
+                        f"[{self.initials}] arc '{entry['title']}' should hold "
+                        f"local {local} (absolute {episode}) but no link found"
+                    )
+                    return []
+                entry_page = _fetch(shared_state, target, timeout)
+                if entry_page is None:
+                    return []
+                debug(
+                    f"[{self.initials}] absolute {episode} -> '{entry['title']}' "
+                    f"local {local}"
+                )
+                return self._releases_from_episode_page(
+                    shared_state,
+                    entry_page,
+                    target,
+                    series_title=base_title,
+                    episode_number=episode,
+                    year=entry.get("year") or "",
+                    as_movie=False,
+                )
+            offset += count
+
+        debug(
+            f"[{self.initials}] absolute {episode} exceeds franchise total "
+            f"{offset} across {len(chain)} arc(s)"
+        )
+        return []
 
     def _releases_from_episode_page(
         self,
@@ -394,8 +485,6 @@ def _title_candidates(shared_state, imdb_id, language, search_category, want_mov
 
     if not want_movie:
         try:
-            from quasarr.providers import sonarr_api
-
             client = sonarr_api.get_client(shared_state)
             # Deliberately the stored library list, not series_lookup_imdb():
             # Sonarr's /series/lookup endpoint returns alternateTitles=[] and
@@ -427,6 +516,63 @@ def _title_candidates(shared_state, imdb_id, language, search_category, want_mov
         seen.add(key)
         out.append(candidate)
     return out
+
+
+def _canonical_absolute_episode(shared_state, imdb_id, requested_episode):
+    """Translate Sonarr scene-absolute numbering to canonical absolute numbering.
+
+    For anime with ``useSceneNumbering``, Sonarr sends the scene absolute value
+    in the Newznab ``q`` parameter. Bleach S17E44 therefore arrives as 44 even
+    though its canonical absolute number is 410. Multiple episodes can share a
+    scene absolute value; the episode Sonarr is currently searching has the
+    newest ``lastSearchTime``, so that timestamp disambiguates the mapping.
+    """
+    try:
+        requested = int(requested_episode)
+    except (TypeError, ValueError):
+        return requested_episode
+
+    try:
+        client = sonarr_api.get_client(shared_state)
+        if client is None:
+            return requested
+
+        series = next(
+            (
+                record
+                for record in client._get("/series") or []
+                if record.get("imdbId") == imdb_id
+            ),
+            None,
+        )
+        if not series or not series.get("useSceneNumbering") or not series.get("id"):
+            return requested
+
+        matches = []
+        for record in client._get(
+            "/episode", params={"seriesId": series["id"]}
+        ) or []:
+            if record.get("sceneAbsoluteEpisodeNumber") != requested:
+                continue
+            absolute = record.get("absoluteEpisodeNumber")
+            if absolute is None:
+                continue
+            matches.append(record)
+
+        if not matches:
+            return requested
+
+        chosen = max(matches, key=lambda record: record.get("lastSearchTime") or "")
+        absolute = int(chosen["absoluteEpisodeNumber"])
+        if absolute != requested:
+            debug(
+                f"[{Source.initials}] Sonarr scene absolute {requested} -> "
+                f"canonical absolute {absolute}"
+            )
+        return absolute
+    except Exception as exc:
+        debug(f"[{Source.initials}] Sonarr absolute-number lookup failed: {exc}")
+        return requested
 
 
 def _host(shared_state):
@@ -523,6 +669,12 @@ def _anime_year(page) -> str:
 
 
 def _episode_links(page) -> list[str]:
+    """Every ``/episode/`` href on the page.
+
+    Kept only for the movie edge (a film has a single entry page linked from
+    the anime page). Episode-number matching must use _episode_entries instead,
+    which reads the number from the listing card rather than the URL slug.
+    """
     return _dedupe(
         [a["href"] for a in page.find_all("a", href=True) if "/episode/" in a["href"]]
     )
@@ -537,27 +689,68 @@ def _is_movie_entry(url: str) -> bool:
     return AR_FILM in unquote(url)
 
 
-def _find_episode_url(shared_state, anime_url: str, first_page, episode: int, timeout):
-    """Walk the series pagination until the requested episode turns up.
+def _episode_entries(page) -> list[tuple]:
+    """(number, url) pairs from the listing cards on an anime page.
 
-    Listings run newest-first, so the requested episode is usually on page 1
-    for ongoing series and deeper for back-catalogue requests.
+    The card's ``.ep_num`` text ("الحلقة 330") carries the real episode number;
+    the slug does not (it may lie - "الحلقة-44pss" is episode 330 - or omit the
+    number entirely). Only cards that actually link to an episode are returned,
+    which also drops sidebar / related-anime widgets that link to ``/anime/``.
+    """
+    entries = []
+    for card in page.select(".anime-card-container"):
+        link = card.select_one('a[href*="/episode/"]')
+        if not link:
+            continue
+        url = link["href"]
+        number = None
+        num_el = card.select_one(".ep_num")
+        if num_el:
+            match = EPISODE_NUM_PATTERN.search(num_el.get_text(" ", strip=True))
+            if match:
+                number = int(match.group(1))
+        if number is None:
+            # Last resort: a well-formed number in the slug (rare, but harmless
+            # now that the pattern rejects junk suffixes).
+            number = _episode_number(url)
+        entries.append((number, url))
+    return entries
+
+
+def _max_episode_number(page) -> int:
+    """Highest local episode number visible on the first listing page.
+
+    Listings run newest-first, so page 1 always carries the latest (highest)
+    episode, which for a contiguous 1..N run equals the arc's episode count.
+    """
+    numbers = [
+        number
+        for number, url in _episode_entries(page)
+        if number is not None and not _is_movie_entry(url)
+    ]
+    return max(numbers) if numbers else 0
+
+
+def _locate_episode(shared_state, anime_url: str, first_page, episode, timeout):
+    """Return ``(url, number)`` for the requested episode, or ``(None, None)``.
+
+    ``episode`` is a local number here (or None for "newest"). Walks the series
+    pagination newest-first; the requested episode is usually on page 1 for
+    ongoing series and deeper for back-catalogue requests.
     """
     pages = [first_page]
     known = _page_numbers(first_page)
 
     for page_index in range(1, MAX_EPISODE_PAGES + 1):
         page = pages[-1]
-        for url in _episode_links(page):
+        for number, url in _episode_entries(page):
             if _is_movie_entry(url):
                 continue
-            number = _episode_number(url)
             if episode is None:
-                # No specific episode requested - take the newest one.
                 if number is not None:
-                    return url
+                    return url, number
             elif number == episode:
-                return url
+                return url, number
 
         if page_index >= known:
             break
@@ -567,7 +760,49 @@ def _find_episode_url(shared_state, anime_url: str, first_page, episode: int, ti
             break
         pages.append(next_page)
 
-    return None
+    return None, None
+
+
+def _franchise_chain(shared_state, candidates: list[dict], timeout) -> list[dict]:
+    """Ordered arc chain for absolute-number resolution.
+
+    Keeps only subtitled TV entries (movies, specials and Arabic-dub duplicates
+    are excluded so they cannot inflate the cumulative offset), then orders them
+    oldest-first. Each entry carries its fetched page and local episode count.
+    Search-result order breaks ties within a year so the mapping stays stable.
+    """
+    chain = []
+    for index, candidate in enumerate(candidates):
+        title = candidate.get("title") or ""
+        url = candidate.get("url") or ""
+        if AR_DUBBED in title or AR_DUBBED in unquote(url):
+            continue
+
+        page = _fetch(shared_state, url, timeout)
+        if page is None:
+            continue
+        if _anime_type(page).lower() != "tv":
+            continue
+
+        count = _max_episode_number(page)
+        if count <= 0:
+            continue
+
+        year = _anime_year(page)
+        chain.append(
+            {
+                "title": _page_title(page) or title,
+                "url": url,
+                "page": page,
+                "count": count,
+                "year": year,
+                "year_key": int(year) if year.isdigit() else 9999,
+                "order": index,
+            }
+        )
+
+    chain.sort(key=lambda e: (e["year_key"], e["count"], e["order"]))
+    return chain
 
 
 def _page_numbers(page) -> int:
