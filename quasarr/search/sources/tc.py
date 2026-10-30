@@ -45,6 +45,14 @@ from quasarr.providers.utils import (
     get_base_search_category_id,
     is_imdb_id,
 )
+from quasarr.search.sources.helpers.a4u_hints import (
+    hint_episode_url,
+    hint_titles,
+    mapped_season,
+    publish_site,
+    relabel_releases,
+    season_map_entries,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -129,30 +137,47 @@ class Source(AbstractSearchSource):
         base_category = get_base_search_category_id(search_category)
         want_movie = base_category == SEARCH_CAT_MOVIES
 
+        publish_site(shared_state, self.initials, host)
         imdb_id = is_imdb_id(search_string)
         if imdb_id:
-            query = get_localized_title(
+            localized = get_localized_title(
                 shared_state, imdb_id, self.language, search_category
             )
-            if not query:
+            queries = hint_titles(shared_state, imdb_id, self.initials)
+            if localized and localized not in queries:
+                queries.append(localized)
+            if not queries:
                 debug(f"[{self.initials}] could not resolve a title for {imdb_id}")
                 return []
         else:
-            query = search_string
+            queries = [search_string]
             imdb_id = None
 
         try:
-            releases = self._search_one(
-                shared_state,
-                host,
-                query,
-                want_movie=want_movie,
-                season=season,
-                episode=episode,
-                imdb_id=imdb_id,
-            )
-            if releases:
-                clear_hostname_issue(self.initials)
+            releases = []
+            if imdb_id and not want_movie and season and episode:
+                releases = self._hinted_episode(
+                    shared_state, host, imdb_id, int(season), int(episode), queries[0]
+                )
+            for query in queries:
+                if releases:
+                    break
+                releases = self._search_one(
+                    shared_state,
+                    host,
+                    query,
+                    want_movie=want_movie,
+                    season=season,
+                    episode=episode,
+                    imdb_id=imdb_id,
+                )
+            if not releases:
+                return []
+            clear_hostname_issue(self.initials)
+            if imdb_id:
+                releases = relabel_releases(
+                    shared_state, releases, imdb_id, self.initials
+                )
             return releases
         except Exception as exc:
             mark_hostname_issue(self.initials, "search", str(exc))
@@ -181,7 +206,7 @@ class Source(AbstractSearchSource):
 
             cards = [
                 c
-                for c in _parse_cards(soup)
+                for c in _apply_season_map(shared_state, _parse_cards(soup), None)
                 if c["kind"] == ("movie" if want_movie else "episode")
             ][:MAX_FEED_ITEMS]
             if not cards:
@@ -233,7 +258,7 @@ class Source(AbstractSearchSource):
             mark_hostname_issue(self.initials, "search", f"no response from {url}")
             return []
 
-        cards = _parse_cards(soup)
+        cards = _apply_season_map(shared_state, _parse_cards(soup), imdb_id)
         if not cards:
             return []
 
@@ -290,7 +315,7 @@ class Source(AbstractSearchSource):
             page = _fetch(shared_state, card["url"], SEARCH_REQUEST_TIMEOUT_SECONDS)
             if page is None:
                 continue
-            pack_url = _season_pack_url(page, season)
+            pack_url = _season_pack_url(page, card.get("site_season") or season)
             if not pack_url:
                 continue
             # Confirm the pack actually exposes download mirrors before emitting.
@@ -341,6 +366,27 @@ class Source(AbstractSearchSource):
             if release:
                 releases.append(release)
         return releases
+
+    def _hinted_episode(self, shared_state, host, imdb_id, season, episode, label):
+        key = f"S{season:02d}E{episode:02d}"
+        url = hint_episode_url(shared_state, imdb_id, self.initials, key, host)
+        if not url:
+            return []
+        card = {
+            "title": label,
+            "name": label,
+            "url": url,
+            "kind": "episode",
+            "season": season,
+            "episode": episode,
+            "year": "",
+            "resolution": None,
+            "source_token": None,
+        }
+        release = self._release_from_card(
+            shared_state, card, imdb_id=imdb_id, as_season_pack=False
+        )
+        return [release] if release else []
 
     def _release_from_card(
         self, shared_state, card: dict, imdb_id, as_season_pack: bool
@@ -447,6 +493,23 @@ def _parse_cards(soup) -> list[dict]:
             }
         )
     return cards
+
+
+def _apply_season_map(shared_state, cards: list[dict], imdb_id) -> list[dict]:
+    """Rewrite site seasons to TVDB seasons per the scout's hints.
+
+    ``site_season`` keeps the site's own number for season-pack URL lookup.
+    """
+    entries = season_map_entries(shared_state, Source.initials, imdb_id)
+    if not entries:
+        return cards
+    out = []
+    for card in cards:
+        season = mapped_season(entries, card["name"], card["season"])
+        if season != card["season"]:
+            card = {**card, "season": season, "site_season": card["season"]}
+        out.append(card)
+    return out
 
 
 def _classify_title(raw_title: str, href: str):

@@ -44,6 +44,12 @@ from quasarr.providers.utils import (
     get_base_search_category_id,
     is_imdb_id,
 )
+from quasarr.search.sources.helpers.a4u_hints import (
+    hint_episode_url,
+    hint_titles,
+    publish_site,
+    relabel_releases,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -133,10 +139,14 @@ class Source(AbstractSearchSource):
 
         # Sonarr/Radarr send the IMDb ID when they have one; the site only
         # indexes romaji/English titles, so trade the ID for a title first.
+        publish_site(shared_state, self.initials, host)
         imdb_id = is_imdb_id(search_string)
         if imdb_id:
-            queries = _title_candidates(
-                shared_state, imdb_id, self.language, search_category, want_movie
+            queries = _dedupe(
+                hint_titles(shared_state, imdb_id, self.initials)
+                + _title_candidates(
+                    shared_state, imdb_id, self.language, search_category, want_movie
+                )
             )
             if not queries:
                 debug(f"[{self.initials}] could not resolve a title for {imdb_id}")
@@ -149,17 +159,46 @@ class Source(AbstractSearchSource):
             queries = [search_string]
 
         try:
+            releases = []
+            if imdb_id and not want_movie and episode is not None:
+                releases = self._hinted_episode(
+                    shared_state, host, imdb_id, episode, queries[0]
+                )
             for query in queries:
+                if releases:
+                    break
                 releases = self._search_one(
                     shared_state, host, query, want_movie, episode
                 )
-                if releases:
-                    clear_hostname_issue(self.initials)
-                    return releases
-            return []
+            if not releases:
+                return []
+            clear_hostname_issue(self.initials)
+            if imdb_id:
+                releases = relabel_releases(
+                    shared_state, releases, imdb_id, self.initials
+                )
+            return releases
         except Exception as exc:
             mark_hostname_issue(self.initials, "search", str(exc))
             return []
+
+    def _hinted_episode(self, shared_state, host, imdb_id, episode, label):
+        url = hint_episode_url(shared_state, imdb_id, self.initials, episode, host)
+        if not url:
+            return []
+        page = _fetch(shared_state, url, SEARCH_REQUEST_TIMEOUT_SECONDS)
+        if page is None:
+            debug(f"[{self.initials}] hinted episode page unavailable: {url}")
+            return []
+        return self._releases_from_episode_page(
+            shared_state,
+            page,
+            url,
+            series_title=_series_title_from_episode(page) or label,
+            episode_number=episode,
+            year=None,
+            as_movie=False,
+        )
 
     def _search_one(self, shared_state, host, query, want_movie, episode):
         url = f"https://{host}/?s={quote_plus(query)}"

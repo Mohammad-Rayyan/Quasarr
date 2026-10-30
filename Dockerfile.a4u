@@ -9,7 +9,12 @@
 # like "[Anime4up.rest] OP EP 1172 FHD.mp4" become the Quasarr release title
 # before *arr imports.
 
-FROM ghcr.io/rix1337/quasarr:latest
+# The overlay replaces upstream internals (providers/utils.py, myjd_api.py,
+# downloads/packages) with this repo's copies, so BASE must match the upstream
+# version those copies came from. Override with an already-running image to
+# ship adapter changes without an upstream bump.
+ARG BASE=ghcr.io/rix1337/quasarr:latest
+FROM ${BASE}
 
 ARG PKG=/opt/uv-tools/quasarr/lib/python3.12/site-packages/quasarr
 
@@ -19,6 +24,16 @@ COPY quasarr/search/sources/sh.py    ${PKG}/search/sources/sh.py
 COPY quasarr/downloads/sources/sh.py ${PKG}/downloads/sources/sh.py
 COPY quasarr/search/sources/tc.py    ${PKG}/search/sources/tc.py
 COPY quasarr/downloads/sources/tc.py ${PKG}/downloads/sources/tc.py
+COPY quasarr/search/sources/ak.py    ${PKG}/search/sources/ak.py
+COPY quasarr/downloads/sources/ak.py ${PKG}/downloads/sources/ak.py
+COPY quasarr/search/sources/tk.py    ${PKG}/search/sources/tk.py
+COPY quasarr/downloads/sources/tk.py ${PKG}/downloads/sources/tk.py
+COPY quasarr/search/sources/wt.py    ${PKG}/search/sources/wt.py
+COPY quasarr/downloads/sources/wt.py ${PKG}/downloads/sources/wt.py
+
+# Scout hints (claude-cron writes /config/a4u_hints.json) + canonical relabel
+COPY quasarr/search/sources/helpers/a4u_hints.py \
+     ${PKG}/search/sources/helpers/a4u_hints.py
 
 # Sonarr absolute-episode import fix (hoster filename -> release title)
 COPY quasarr/downloads/sources/helpers/sonarr_filenames.py \
@@ -33,8 +48,11 @@ COPY quasarr/downloads/packages/__init__.py ${PKG}/downloads/packages/__init__.p
 RUN /opt/uv-tools/quasarr/bin/python -c "\
 from quasarr.search.sources.helpers import get_hostnames; \
 from quasarr.downloads.sources.helpers.sonarr_filenames import release_filename_for; \
+from quasarr.search.sources.helpers.a4u_hints import relabel_title; \
+ours = ('a4', 'sh', 'tc', 'ak', 'tk', 'wt'); \
 names = get_hostnames(); \
-missing = [k for k in ('a4', 'sh', 'tc') if k not in names]; \
+missing = [k for k in ours if k not in names]; \
 assert not missing, 'not registered: %s (have %s)' % (missing, names); \
 assert release_filename_for('[A4U] X - 1', 'a.mp4').endswith('.mp4'); \
-print('a4 + sh + tc + sonarr_filenames registered alongside', len(names) - 3, 'upstream sources')"
+assert relabel_title('[A4U] X - 001 [1080p]', 'Y') == '[A4U] Y - 001 [1080p]'; \
+print(' + '.join(ours), '+ hints registered alongside', len(names) - len(ours), 'upstream sources')"

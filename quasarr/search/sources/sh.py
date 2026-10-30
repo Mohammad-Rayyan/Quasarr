@@ -40,7 +40,6 @@ from quasarr.constants import (
     SEARCH_CAT_SHOWS_ANIME,
     SEARCH_REQUEST_TIMEOUT_SECONDS,
 )
-from quasarr.providers import shared_state
 from quasarr.providers.hostname_issues import clear_hostname_issue, mark_hostname_issue
 from quasarr.providers.imdb_metadata import get_localized_title
 from quasarr.providers.log import debug
@@ -48,6 +47,13 @@ from quasarr.providers.utils import (
     generate_download_link,
     get_base_search_category_id,
     is_imdb_id,
+)
+from quasarr.search.sources.helpers.a4u_hints import (
+    hint_episode_url,
+    hint_titles,
+    publish_site,
+    relabel_releases,
+    sonarr_titles,
 )
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
@@ -72,6 +78,9 @@ QUALITY_TOKENS = (
 )
 
 MAX_SEARCH_CANDIDATES = 4
+# Each query costs a search page plus up to MAX_SEARCH_CANDIDATES entry pages;
+# Sonarr's indexer timeout bounds how many fallbacks fit.
+MAX_TITLE_QUERIES = 3
 MAX_FEED_ITEMS = 12
 FEED_FETCH_WORKERS = 6
 
@@ -122,55 +131,94 @@ class Source(AbstractSearchSource):
             )
             return []
 
+        publish_site(shared_state, self.initials, host)
         imdb_id = is_imdb_id(search_string)
         if imdb_id:
-            resolved = get_localized_title(
+            localized = get_localized_title(
                 shared_state, imdb_id, self.language, search_category
             )
-            if not resolved:
+            queries = _dedupe(
+                hint_titles(shared_state, imdb_id, self.initials)
+                + ([localized] if localized else [])
+                + sonarr_titles(shared_state, imdb_id)
+            )[:MAX_TITLE_QUERIES]
+            if not queries:
                 debug(f"[{self.initials}] no title for {imdb_id}")
                 return []
-            search_string = resolved
+        else:
+            queries = [search_string]
 
         try:
-            url = f"https://{host}/?s={quote_plus(search_string)}"
-            soup = _fetch(shared_state, url, SEARCH_REQUEST_TIMEOUT_SECONDS)
-            if soup is None:
-                mark_hostname_issue(self.initials, "search", f"no response from {url}")
-                return []
-
-            cards = [c for c in _parse_posters(soup) if not _is_dubbed(c["url"], c["text"])]
-            wanted = [c for c in cards if c["is_movie"] == want_movie]
-            matches = [c for c in wanted if _title_matches(search_string, c["text"])]
-            # Ranking matters more than filtering here: a query like "One Piece"
-            # returns specials, arcs and movies that all legitimately contain the
-            # query tokens, and the real series is not first. Prefer /seasons/
-            # (the verified series container) and the fewest extra title tokens.
-            ordered = sorted(
-                matches or wanted, key=lambda c: _rank(search_string, c)
-            )[:MAX_SEARCH_CANDIDATES]
-
-            releases: list[SearchRelease] = []
-            for card in ordered:
-                releases.extend(
-                    self._releases_for_entry(
-                        shared_state,
-                        card,
-                        want_movie=want_movie,
-                        episode=episode,
-                        timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
-                    )
+            releases = []
+            if imdb_id and episode is not None:
+                releases = self._hinted_episode(
+                    shared_state, host, imdb_id, episode, queries[0]
                 )
-
-            # Several season entries can match one query (main series, arc
-            # re-cuts), each yielding an identical release title.
-            releases = _dedupe_by_title(releases)
-            if releases:
-                clear_hostname_issue(self.initials)
+            for query in queries:
+                if releases:
+                    break
+                releases = self._search_one(
+                    shared_state, host, query, want_movie, episode
+                )
+            if not releases:
+                return []
+            clear_hostname_issue(self.initials)
+            if imdb_id:
+                releases = relabel_releases(
+                    shared_state, releases, imdb_id, self.initials
+                )
             return releases
         except Exception as exc:
             mark_hostname_issue(self.initials, "search", str(exc))
             return []
+
+    def _hinted_episode(self, shared_state, host, imdb_id, episode, label):
+        url = hint_episode_url(shared_state, imdb_id, self.initials, episode, host)
+        if not url:
+            return []
+        return self._releases_from_episode(
+            shared_state,
+            url,
+            _series_title(label),
+            episode,
+            None,
+            False,
+            SEARCH_REQUEST_TIMEOUT_SECONDS,
+        )
+
+    def _search_one(self, shared_state, host, query, want_movie, episode):
+        url = f"https://{host}/?s={quote_plus(query)}"
+        soup = _fetch(shared_state, url, SEARCH_REQUEST_TIMEOUT_SECONDS)
+        if soup is None:
+            mark_hostname_issue(self.initials, "search", f"no response from {url}")
+            return []
+
+        cards = [c for c in _parse_posters(soup) if not _is_dubbed(c["url"], c["text"])]
+        wanted = [c for c in cards if c["is_movie"] == want_movie]
+        matches = [c for c in wanted if _title_matches(query, c["text"])]
+        # Ranking matters more than filtering here: a query like "One Piece"
+        # returns specials, arcs and movies that all legitimately contain the
+        # query tokens, and the real series is not first. Prefer /seasons/
+        # (the verified series container) and the fewest extra title tokens.
+        ordered = sorted(
+            matches or wanted, key=lambda c: _rank(query, c)
+        )[:MAX_SEARCH_CANDIDATES]
+
+        releases: list[SearchRelease] = []
+        for card in ordered:
+            releases.extend(
+                self._releases_for_entry(
+                    shared_state,
+                    card,
+                    want_movie=want_movie,
+                    episode=episode,
+                    timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
+                )
+            )
+
+        # Several season entries can match one query (main series, arc
+        # re-cuts), each yielding an identical release title.
+        return _dedupe_by_title(releases)
 
     def feed(
         self,
